@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -40,6 +40,12 @@ class CheckLicenseResponse(BaseModel):
     userId: str
     isActive: bool
     expiresAt: datetime | None = None
+
+class CreateCheckoutRequest(BaseModel):
+    userId: str = Field(..., min_length=1)
+
+class CreateCheckoutResponse(BaseModel):
+    checkout_url: str
 
 
 class WebhookResponse(BaseModel):
@@ -153,7 +159,57 @@ def check_license(
         isActive=is_active,
         expiresAt=expires_at,
     )
+@app.post("/create_checkout", response_model=CreateCheckoutResponse)
+def create_checkout(
+    payload: CreateCheckoutRequest,
+    request: Request,
+    _: None = Depends(require_api_key),
+) -> CreateCheckoutResponse:
+    if not settings.mp_access_token:
+        raise HTTPException(status_code=500, detail="MP_ACCESS_TOKEN not configured")
 
+    base_url = str(request.base_url).rstrip("/")
+    mp_payload = {
+        "items": [
+            {
+                "title": "Mensalidade PsicoDesk",
+                "quantity": 1,
+                "currency_id": "BRL",
+                "unit_price": 29.90,
+            }
+        ],
+        "external_reference": payload.userId,
+        "notification_url": f"{base_url}/webhook",
+        "metadata": {
+            "userId": payload.userId,
+            "duration_days": settings.default_subscription_days,
+        },
+    }
+
+    headers = {
+        "Authorization": f"Bearer {settings.mp_access_token}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        resp = httpx.post(
+            "https://api.mercadopago.com/checkout/preferences",
+            headers=headers,
+            json=mp_payload,
+            timeout=20,
+        )
+    except httpx.HTTPError:
+        raise HTTPException(status_code=502, detail="Mercado Pago request failed")
+
+    if resp.status_code not in (200, 201):
+        raise HTTPException(status_code=502, detail=f"Mercado Pago error: {resp.text}")
+
+    data = resp.json()
+    checkout_url = data.get("init_point") or data.get("sandbox_init_point")
+    if not checkout_url:
+        raise HTTPException(status_code=502, detail="Mercado Pago did not return checkout URL")
+
+    return CreateCheckoutResponse(checkout_url=checkout_url)
 
 @app.post("/webhook", response_model=WebhookResponse)
 def webhook(
